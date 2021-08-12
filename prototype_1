@@ -1,0 +1,162 @@
+#include "led-matrix-c.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <err.h>
+#include <math.h>
+
+#define BUFSIZE 638
+
+uint8_t channelValue[513];
+uint16_t universeNum;
+int pixelNum;
+uint8_t tempX;
+
+struct pixelInfo
+{
+	uint8_t location_x;
+	uint8_t location_y;
+	uint8_t colour_R;
+	uint8_t colour_G;
+	uint8_t colour_B;
+};
+struct pixelInfo newPixel;
+
+//DEBUGGING
+void updatePixel()
+{
+	printf("  Pixel no. is: %d\n", pixelNum);
+	printf(" Pixel is at x: %d\n", newPixel.location_x);
+	printf("             y: %d\n", newPixel.location_y);
+	printf("   in universe: %d\n", universeNum);
+	printf("and value is R: %d\n", newPixel.colour_R);
+	printf("             G: %d\n", newPixel.colour_G);
+	printf("             B: %d\n\n", newPixel.colour_B);
+}
+
+int main(int argc, char **argv) 
+{	/*NETWORKING SETUP*/
+	char* group="255.255.255.0";
+	int port_action=5568;
+	int socket_recv=socket(AF_INET, SOCK_DGRAM, 0);
+	if(socket_recv<0)
+	{
+		perror("socket");
+		return 1;
+	}
+	
+	/*ALLOW MULTIPLE SOCKETS (in case of multiple programs) TO USE A SINGLE PORT*/
+	u_int yes=1;
+	if(setsockopt(socket_recv, SOL_SOCKET, SO_REUSEADDR, (char*) &yes, sizeof(yes))<0)
+	{
+		perror("Reusing ADDR failed");
+		return 1;
+	}
+	
+	//CONFIGURE DESTINATION ADDRESS
+	struct sockaddr_in addr_message;
+	memset(&addr_message, 0, sizeof(addr_message));
+	addr_message.sin_family=AF_INET;
+	addr_message.sin_addr.s_addr=htonl(INADDR_ANY);
+	addr_message.sin_port=htons(port_action);
+	//BIND RECEIVING ADDRESS
+	if (bind(socket_recv, (struct sockaddr*) &addr_message, sizeof(addr_message))<0)
+	{
+		perror("bind");
+		return 1;
+	}
+	if(group[0]=='2' && group[1]=='3' && group[2]=='9')
+	{
+		//JOIN MULTICAST GROUP
+		struct ip_mreq mreq;
+		mreq.imr_multiaddr.s_addr=inet_addr(group);
+		mreq.imr_interface.s_addr=htonl(INADDR_ANY);
+		if(setsockopt(socket_recv, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*) &mreq, sizeof(mreq))<0)
+		{
+			perror("setsockopt");
+			return 1;
+		}
+	}
+	
+	//ADD TIMEOUT TO PREVENT HANGS ON NO OR IMPROPER PACKET RECEIVES
+	struct timeval read_timeout;
+	read_timeout.tv_sec=0;
+	read_timeout.tv_usec=5;
+	setsockopt(socket_recv, SOL_SOCKET, SO_RCVTIMEO, &read_timeout, sizeof read_timeout);
+	
+	/*PANEL SETUP*/
+	struct RGBLedMatrixOptions options;
+	struct RGBLedMatrix *matrix;
+	struct LedCanvas *offscreen_canvas;
+	struct LedCanvas *previous_canvas;
+	int width, height;
+
+	memset(&options, 0, sizeof(options));
+	options.brightness=100;					//already default...?
+	options.rows=64;
+	options.cols=64;
+	options.chain_length=3;
+	
+	matrix=led_matrix_create_from_options(&options, &argc, &argv);
+	if(matrix==NULL)
+		return 1;
+
+	//USE OFFSCREEN_CANVAS TO CREATE A BUFFER
+	offscreen_canvas=led_matrix_create_offscreen_canvas(matrix);
+	led_canvas_get_size(offscreen_canvas, &width, &height);
+
+	fprintf(stderr, "Size: %dx%d. Hardware GPIO mapping: %s\n", width, height, options.hardware_mapping);
+	
+	while(1)
+	{
+		//RECEIVE MESSAGE AND STORE DATA
+		uint8_t buf_message[BUFSIZE];
+		int addrlen_message=sizeof(addr_message);
+		int bytes_recv=recvfrom(socket_recv,buf_message,BUFSIZE,0,(struct sockaddr *)&addr_message,&addrlen_message);
+		/*buf_message contains entire sACN packet. use the following to extract universe and values:
+		universe must be "ntohs". it is contained in bytes 113-114 (using 0th)
+		values begin at byte 125, though the first byte is a start code
+		*/
+		if(bytes_recv>0)
+		{
+			universeNum=ntohs(buf_message[113])|ntohs(buf_message[114])>>8;
+			for(int pos=0; pos<510; pos++)
+			{
+				int pixelStep=pos+1;
+				channelValue[pixelStep]=buf_message[pos+126];
+				pixelNum=ceil((((universeNum-1)*510)+pixelStep)/3);
+				if((pixelStep+2)%3==0)
+				{
+					newPixel.colour_R=channelValue[pixelStep];
+				}
+				else if((pixelStep+1)%3==0)
+				{
+					newPixel.colour_G=channelValue[pixelStep];
+				}
+				else if(pixelStep%3==0)
+				{
+					newPixel.colour_B=channelValue[pixelStep];
+					tempX=(pixelNum/192);
+					newPixel.location_x=ceil(tempX);
+					newPixel.location_y=(pixelNum-1)-(newPixel.location_x*192);
+					//updatePixel();
+					led_canvas_set_pixel(offscreen_canvas,newPixel.location_x,newPixel.location_y,newPixel.colour_R,newPixel.colour_G,newPixel.colour_B);
+					if(pixelNum==(width*height))
+					{
+						offscreen_canvas=led_matrix_swap_on_vsync(matrix, offscreen_canvas);
+					}
+				}
+			}
+		}
+	}
+	led_matrix_delete(matrix);
+	return 0;
+}
